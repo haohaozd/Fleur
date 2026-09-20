@@ -1,0 +1,154 @@
+# =============================================================================
+#  Fleur 镜像构建 —— 在 GitHub Actions 上编译并推送到 GHCR
+# =============================================================================
+#
+#  放置位置：你 fork 的仓库根目录下的  .github/workflows/build-images.yml
+#
+#  为什么需要它：
+#    官方仓库没有预构建镜像，3 个应用镜像都必须从源码编译，
+#    其中 2 个包含 Rust release 编译。N100（4 核）本地编译需 1.5~3 小时，
+#    因此改为在 GitHub 托管 runner 上构建，绿联 NAS 只负责 docker pull。
+#
+#  产出（linux/amd64，匹配 Intel N100）：
+#    ghcr.io/<你的GitHub用户名>/fleur-dagster:<tag>
+#    ghcr.io/<你的GitHub用户名>/fleur-rearview:<tag>
+#    ghcr.io/<你的GitHub用户名>/fleur-nginx:<tag>
+#
+#  触发方式：Actions 页面 → Build Fleur Images → Run workflow
+#
+#  三个 Dockerfile 都使用了 `RUN --mount=type=cache`，
+#  因此必须走 BuildKit —— docker/setup-buildx-action 已保证这一点。
+# =============================================================================
+
+name: Build Fleur Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "额外的镜像标签（留空则只产出 sha-xxxxxxx）"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+# 最小权限：只读源码，只写包
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-fleur-images-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # GHCR 的命名空间必须全小写，而 GitHub 用户名可能含大写字母，先归一化
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Resolve registry namespace
+    runs-on: ubuntu-24.04
+    outputs:
+      owner: ${{ steps.vars.outputs.owner }}
+    steps:
+      - id: vars
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 三个镜像并行构建，互不阻塞
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build fleur-${{ matrix.image }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: dagster
+            file: deploy/docker/dagster/Dockerfile
+            scope: dagster
+            build_args: ""
+          - image: rearview
+            file: deploy/docker/rearview/Dockerfile
+            scope: rearview
+            build_args: ""
+          - image: nginx
+            file: deploy/docker/nginx/Dockerfile
+            scope: nginx
+            # 空值表示前端走同源相对路径，由 nginx 反代到 rearview-server，
+            # 这样镜像里不烤入任何 NAS 的 IP / 端口，换机器无需重新构建。
+            build_args: |
+              RACINGLINE_GIT_SHA=${{ github.sha }}
+
+    steps:
+      - name: Checkout
+        # actions/checkout v4 —— SHA 锁定
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up BuildKit
+        # docker/setup-buildx-action v3 —— SHA 锁定
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to GHCR
+        # docker/login-action v3 —— SHA 锁定
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        # docker/metadata-action v5 —— SHA 锁定
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+        with:
+          images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.owner }}/fleur-${{ matrix.image }}
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+
+      - name: Build and push
+        id: build
+        # docker/build-push-action v6 —— SHA 锁定
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          # 注意：官方 compose 里 context 是相对 deploy/ 的 ".."，
+          # 在 workflow 里等价于仓库根的 "."
+          context: .
+          file: ${{ matrix.file }}
+          platforms: linux/amd64
+          push: true
+          pull: true
+          # 关闭 provenance/sbom：避免产出 OCI index，
+          # 部分 NAS 上的 docker 对带 attestation 的镜像拉取兼容性不佳
+          provenance: false
+          sbom: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ matrix.build_args }}
+          # 分层缓存走 GitHub Actions 缓存，每个镜像独立 scope，
+          # 后续重新构建时 cargo fetch / uv sync / npm ci 层可命中
+          cache-from: type=gha,scope=${{ matrix.scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.scope }}
+
+      # -----------------------------------------------------------------------
+      # 把镜像标签与 digest 打到运行摘要里，方便你按 digest 精确锁定版本
+      # -----------------------------------------------------------------------
+      - name: Record digest
+        run: |
+          {
+            echo "### fleur-${{ matrix.image }}"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo "digest: ${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
